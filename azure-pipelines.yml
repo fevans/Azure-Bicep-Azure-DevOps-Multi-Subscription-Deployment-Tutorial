@@ -1,0 +1,46 @@
+trigger:
+
+  - main
+
+variables:
+  azureServiceConnection: 'sc-platform'
+  location: 'uksouth'
+
+stages:
+  - stage: Build
+    jobs:
+      - job: Compile
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az bicep build --file infra/main.bicep
+
+          - publish: infra/main.json
+            artifact: armTemplate
+
+  - stage: Deploy
+    dependsOn: Build
+    jobs:
+      - deployment: DeployInfra
+        environment: prod
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: armTemplate
+
+                - task: AzureResourceManagerTemplateDeployment@3
+                  inputs:
+                    deploymentScope: Subscription
+                    azureResourceManagerConnection: $(azureServiceConnection)
+                    location: $(location)
+                    templateLocation: Linked artifact
+                    csmFile: $(Pipeline.Workspace)/armTemplate/main.json
+                    deploymentMode: Incremental
