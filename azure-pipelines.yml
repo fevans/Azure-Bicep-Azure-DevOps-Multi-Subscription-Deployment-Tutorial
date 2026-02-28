@@ -1,0 +1,284 @@
+# ============================================================
+# Azure DevOps Multi-Subscription Bicep Deployment Pipeline
+# ============================================================
+#
+# This pipeline demonstrates production-style artifact promotion
+# across Dev, Staging, and Production Azure subscriptions.
+#
+# Stages:
+#   1. Build     – Validate & lint Bicep; publish templates as artifact
+#   2. Dev        – Deploy artifact to Dev subscription (auto-deploy)
+#   3. Staging    – Deploy same artifact to Staging subscription (approval gate)
+#   4. Production – Deploy same artifact to Production subscription (approval gate)
+#
+# Prerequisites (configure in Azure DevOps before running):
+#   - Service connections:  dev-service-connection
+#                           staging-service-connection
+#                           prod-service-connection
+#   - Pipeline variables:   DEV_SUBSCRIPTION_ID
+#                           STAGING_SUBSCRIPTION_ID
+#                           PROD_SUBSCRIPTION_ID
+#   - Environments with approval gates:
+#                           development
+#                           staging
+#                           production
+# ============================================================
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - bicep/**
+      - azure-pipelines.yml
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - bicep/**
+      - azure-pipelines.yml
+
+variables:
+  bicepArtifactName: 'bicep-templates'
+  bicepDirectory: '$(Build.SourcesDirectory)/bicep'
+  deploymentLocation: 'eastus'
+
+# ---------------------------------------------------------------------------
+# Stage 1 – Build & Validate
+# ---------------------------------------------------------------------------
+# Validates all Bicep templates and publishes them as a versioned pipeline
+# artifact. Every downstream deploy stage downloads the *same* artifact,
+# which is the cornerstone of artifact-promotion: the exact bits validated
+# in Build are what gets deployed to Production.
+# ---------------------------------------------------------------------------
+stages:
+  - stage: Build
+    displayName: '🔨 Build & Validate'
+    jobs:
+      - job: ValidateAndPublish
+        displayName: 'Validate Bicep Templates & Publish Artifact'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
+            displayName: 'Checkout source code'
+
+          # Install the latest Bicep CLI
+          - task: AzureCLI@2
+            displayName: 'Install Bicep CLI'
+            inputs:
+              azureSubscription: 'dev-service-connection'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: az bicep install
+
+          # Build (transpile) all .bicep files — this catches syntax errors
+          - task: AzureCLI@2
+            displayName: 'Lint & Build Bicep Templates'
+            inputs:
+              azureSubscription: 'dev-service-connection'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                echo "=== Linting Bicep files ==="
+                find $(bicepDirectory) -name "*.bicep" | while read file; do
+                  echo "Building: $file"
+                  az bicep build --file "$file"
+                done
+                echo "=== All Bicep files validated successfully ==="
+
+          # Validate the main template against the Dev subscription
+          # (what-if check – no actual deployment)
+          - task: AzureCLI@2
+            displayName: 'What-If Validation (Dev Subscription)'
+            inputs:
+              azureSubscription: 'dev-service-connection'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az deployment sub what-if \
+                  --name "validate-$(Build.BuildNumber)" \
+                  --location $(deploymentLocation) \
+                  --subscription $(DEV_SUBSCRIPTION_ID) \
+                  --template-file $(bicepDirectory)/main.bicep \
+                  --parameters $(bicepDirectory)/parameters/dev.bicepparam
+
+          # Publish the validated Bicep directory as a pipeline artifact.
+          # All deploy stages download this artifact, ensuring the same
+          # templates are promoted through every environment.
+          - publish: $(bicepDirectory)
+            artifact: $(bicepArtifactName)
+            displayName: 'Publish Bicep Artifact'
+
+  # ---------------------------------------------------------------------------
+  # Stage 2 – Deploy to Dev
+  # ---------------------------------------------------------------------------
+  # Auto-deploys the artifact to the Development subscription.
+  # Uses an Azure DevOps environment ("development") which can be configured
+  # with any desired checks/approvals for the Dev tier.
+  # ---------------------------------------------------------------------------
+  - stage: DeployDev
+    displayName: '🚀 Deploy → Dev'
+    dependsOn: Build
+    condition: succeeded('Build')
+    variables:
+      serviceConnection: 'dev-service-connection'
+      subscriptionId: $(DEV_SUBSCRIPTION_ID)
+      environmentName: 'dev'
+    jobs:
+      - deployment: DeployInfrastructure
+        displayName: 'Deploy Bicep Infrastructure to Dev'
+        environment: 'development'
+        pool:
+          vmImage: 'ubuntu-latest'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                # Download the artifact published by the Build stage
+                - download: current
+                  artifact: $(bicepArtifactName)
+                  displayName: 'Download Bicep Artifact'
+
+                - task: AzureCLI@2
+                  displayName: 'Deploy to Dev Subscription'
+                  inputs:
+                    azureSubscription: $(serviceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      echo "=== Deploying to Dev subscription: $(subscriptionId) ==="
+                      az deployment sub create \
+                        --name "$(Build.BuildNumber)-$(environmentName)" \
+                        --location $(deploymentLocation) \
+                        --subscription $(subscriptionId) \
+                        --template-file $(Pipeline.Workspace)/$(bicepArtifactName)/main.bicep \
+                        --parameters $(Pipeline.Workspace)/$(bicepArtifactName)/parameters/dev.bicepparam \
+                        --verbose
+                      echo "=== Dev deployment complete ==="
+
+  # ---------------------------------------------------------------------------
+  # Stage 3 – Deploy to Staging
+  # ---------------------------------------------------------------------------
+  # Promotes the *same* artifact to the Staging subscription.
+  # The "staging" Azure DevOps environment should be configured with a
+  # pre-deployment approval so a reviewer must approve before it runs.
+  # ---------------------------------------------------------------------------
+  - stage: DeployStaging
+    displayName: '🚀 Deploy → Staging'
+    dependsOn: DeployDev
+    condition: succeeded('DeployDev')
+    variables:
+      serviceConnection: 'staging-service-connection'
+      subscriptionId: $(STAGING_SUBSCRIPTION_ID)
+      environmentName: 'staging'
+    jobs:
+      - deployment: DeployInfrastructure
+        displayName: 'Deploy Bicep Infrastructure to Staging'
+        environment: 'staging'
+        pool:
+          vmImage: 'ubuntu-latest'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: $(bicepArtifactName)
+                  displayName: 'Download Bicep Artifact'
+
+                - task: AzureCLI@2
+                  displayName: 'What-If Preview (Staging)'
+                  inputs:
+                    azureSubscription: $(serviceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      echo "=== What-If preview for Staging ==="
+                      az deployment sub what-if \
+                        --name "$(Build.BuildNumber)-$(environmentName)-preview" \
+                        --location $(deploymentLocation) \
+                        --subscription $(subscriptionId) \
+                        --template-file $(Pipeline.Workspace)/$(bicepArtifactName)/main.bicep \
+                        --parameters $(Pipeline.Workspace)/$(bicepArtifactName)/parameters/staging.bicepparam
+
+                - task: AzureCLI@2
+                  displayName: 'Deploy to Staging Subscription'
+                  inputs:
+                    azureSubscription: $(serviceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      echo "=== Deploying to Staging subscription: $(subscriptionId) ==="
+                      az deployment sub create \
+                        --name "$(Build.BuildNumber)-$(environmentName)" \
+                        --location $(deploymentLocation) \
+                        --subscription $(subscriptionId) \
+                        --template-file $(Pipeline.Workspace)/$(bicepArtifactName)/main.bicep \
+                        --parameters $(Pipeline.Workspace)/$(bicepArtifactName)/parameters/staging.bicepparam \
+                        --verbose
+                      echo "=== Staging deployment complete ==="
+
+  # ---------------------------------------------------------------------------
+  # Stage 4 – Deploy to Production
+  # ---------------------------------------------------------------------------
+  # Promotes the *same* artifact to the Production subscription.
+  # The "production" Azure DevOps environment should be configured with a
+  # required pre-deployment approval and a business-hours deployment window.
+  # ---------------------------------------------------------------------------
+  - stage: DeployProd
+    displayName: '🚀 Deploy → Production'
+    dependsOn: DeployStaging
+    condition: and(succeeded('DeployStaging'), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    variables:
+      serviceConnection: 'prod-service-connection'
+      subscriptionId: $(PROD_SUBSCRIPTION_ID)
+      environmentName: 'prod'
+    jobs:
+      - deployment: DeployInfrastructure
+        displayName: 'Deploy Bicep Infrastructure to Production'
+        environment: 'production'
+        pool:
+          vmImage: 'ubuntu-latest'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: $(bicepArtifactName)
+                  displayName: 'Download Bicep Artifact'
+
+                - task: AzureCLI@2
+                  displayName: 'What-If Preview (Production)'
+                  inputs:
+                    azureSubscription: $(serviceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      echo "=== What-If preview for Production ==="
+                      az deployment sub what-if \
+                        --name "$(Build.BuildNumber)-$(environmentName)-preview" \
+                        --location $(deploymentLocation) \
+                        --subscription $(subscriptionId) \
+                        --template-file $(Pipeline.Workspace)/$(bicepArtifactName)/main.bicep \
+                        --parameters $(Pipeline.Workspace)/$(bicepArtifactName)/parameters/prod.bicepparam
+
+                - task: AzureCLI@2
+                  displayName: 'Deploy to Production Subscription'
+                  inputs:
+                    azureSubscription: $(serviceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      echo "=== Deploying to Production subscription: $(subscriptionId) ==="
+                      az deployment sub create \
+                        --name "$(Build.BuildNumber)-$(environmentName)" \
+                        --location $(deploymentLocation) \
+                        --subscription $(subscriptionId) \
+                        --template-file $(Pipeline.Workspace)/$(bicepArtifactName)/main.bicep \
+                        --parameters $(Pipeline.Workspace)/$(bicepArtifactName)/parameters/prod.bicepparam \
+                        --verbose
+                      echo "=== Production deployment complete ==="
